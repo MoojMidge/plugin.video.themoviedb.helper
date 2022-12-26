@@ -6,6 +6,7 @@ from resources.lib.addon.tmdate import get_timestamp, set_timestamp
 from resources.lib.files.bcache import BasicCache
 from resources.lib.addon.logger import kodi_log
 from resources.lib.addon.consts import CACHE_SHORT, CACHE_LONG
+from threading import Lock
 
 """ Lazyimports
 import xml.etree.ElementTree as ET
@@ -15,7 +16,25 @@ import requests
 """
 
 
-def translate_xml(request):
+def _remove_modules(remove_names=(), blocked_names=(), store=True, restore=None):
+    from sys import modules
+
+    removed_modules = {}
+    for module_name in remove_names:
+        if module_name in modules:
+            module = modules.pop(module_name)
+            if store:
+                removed_modules[module_name] = module
+        if module_name in blocked_names:
+            modules[module_name] = None
+
+    if restore:
+        modules.update(restore)
+
+    return removed_modules
+
+
+def translate_xml(response, ET=[None]):
     def dictify(r, root=True):
         if root:
             return {r.tag: dictify(r, False)}
@@ -28,11 +47,29 @@ def translate_xml(request):
                 d[x.tag] = []
             d[x.tag].append(dictify(x, False))
         return d
-    if request:
-        import xml.etree.ElementTree as ET
-        request = ET.fromstring(request.content)
-        request = dictify(request)
-    return request
+
+    if not ET[0]:
+        from sys import version_info
+        from importlib import import_module
+
+        ET_python_module = 'xml.etree.ElementTree'
+        ET_C_module = '_elementtree'
+
+        if (version_info.major, version_info.minor) != (3, 11):
+            ET[0] = import_module(ET_python_module)
+        else:
+            module_names = (ET_python_module, ET_C_module)
+            blocked_names = (ET_C_module, )
+            original_modules = _remove_modules(module_names, blocked_names)
+            ET[0] = import_module(ET_python_module)
+            _remove_modules(module_names, store=False, restore=original_modules)        
+
+    if response:
+        content = response.iter_content(chunk_size=None, decode_unicode=True)
+        content = ET[0].fromstringlist(content, parser=ET[0].XMLParser(encoding='UTF-8'))
+        content = dictify(content)
+        return content
+    return {}
 
 
 def json_loads(obj):
@@ -41,6 +78,8 @@ def json_loads(obj):
 
 
 class RequestAPI(object):
+    _lock = Lock()
+
     def __init__(self, req_api_url=None, req_api_key=None, req_api_name=None, timeout=None, error_notification=get_setting('connection_notifications')):
         self.req_api_url = req_api_url or ''
         self.req_api_key = req_api_key or ''
@@ -65,12 +104,16 @@ class RequestAPI(object):
         Dialog().notification(note_head, note_body)
 
     def get_api_request_json(self, request=None, postdata=None, headers=None, is_xml=False, method=None):
-        request = self.get_api_request(request=request, postdata=postdata, headers=headers, method=method)
-        if not request:
+        response = self.get_api_request(request=request, postdata=postdata, headers=headers, method=method)
+        if not response:
             return {}
-        response = translate_xml(request) if is_xml else request.json()
-        request.close()
-        return response
+        if is_xml:
+            with self._lock:
+                content = translate_xml(response)
+        else:
+            content = response.json()
+        response.close()
+        return content
 
     def nointernet_err(self, err, log_time=900):
         # Check Kodi internet status to confirm network is down
